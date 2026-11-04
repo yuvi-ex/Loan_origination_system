@@ -70,6 +70,18 @@ The scorecard (logistic regression) and the ML model (gradient boosting) are tra
 
 ## Prerequisites
 
+> **Before you clone**, check that you have:
+>
+> - **A Mac, ideally Apple silicon.** That is the only tested setup. Linux is untested and Windows is not supported.
+> - **The Exasol Personal Local Starter Kit** with the database running, plus the **dash-server** add-on (links and
+>   commands below).
+> - **Docker Desktop or podman (running)**, plus **uv**.
+> - **About 6 GB of disk and about 30 minutes.** Most of that is the 1.6 GB loan-history download.
+> - **Optional: AWS credentials.** With them, Amazon Textract reads the uploads and AWS charges a few cents per
+>   application. To avoid any cost, put `TEXTRACT=off` in `config.local.env` (see [Cost](#cost)).
+
+The details:
+
 **Host:** tested on **macOS on Apple silicon**. The scripts also handle an x86_64 Exasol VM, but that path has not been
 tested. Linux is untested (it needs an Exasol Personal deployment with the same VM layout: `vm-runtime.json`,
 `vm-ssh-key`, `vm-shared/`). Windows is not supported: the setup scripts are bash.
@@ -85,7 +97,7 @@ Tested with: Exasol Personal Local Starter Kit (`exakit`) 0.2.2, the `exasol` CL
   [Exasol Personal](https://github.com/exasol/exasol-personal).
 - **dash-server** add-on for the console: `exakit marketplace dash-server`.
 - **`python3`, `curl` and `ssh`** on the host (on macOS they come with the Command Line Tools: `xcode-select --install`).
-- **Docker Desktop or podman** on the host, only to fetch three public images (`postgres:16`, `mongo:8.2`,
+- **Docker Desktop or podman**, running, on the host, only to fetch three public images (`postgres:16`, `mongo:8.2`,
   `python:3.12-slim`). The Exasol VM has no internet access, so images are pulled on the host and streamed in.
 - **uv** (`brew install uv`); it installs Python 3.12 for the project if needed.
 - About **6 GB** of free disk space (the loan-history download, its prepared copy, the Python environment).
