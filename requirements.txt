@@ -1,0 +1,14 @@
+# Tested together on Python 3.12 (uv venv .venv --python 3.12 && uv pip install --python .venv/bin/python -r requirements.txt)
+pyexasol==3.0.1
+psycopg[binary]==3.3.6
+pymongo==4.19.0
+pandas==3.1.0
+pyarrow==26.0.0
+numpy==2.5.4
+scikit-learn==1.9.1
+reportlab==5.1.0
+pdfplumber==0.11.10
+pypdfium2==5.14.0
+pillow==13.0.0
+boto3==1.43.119
+playwright==1.64.1   # only for tests/click_test.py (then: .venv/bin/python -m playwright install chromium)

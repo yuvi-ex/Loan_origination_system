@@ -1,0 +1,28 @@
+-- Ring detection across the whole pipeline: links that no single application shows.
+-- A payroll template is normally used by ONE employer, and salary normally comes from that employer's account.
+-- So: the same payslip template under different employers, or "salary" from one account under different employers,
+-- or one device behind several applicants, links applications that each pass every check on their own.
+CREATE OR REPLACE VIEW LOS_CORE.FRAUD_LINKS AS
+WITH f AS (SELECT * FROM LOS_CORE.APPLICATION_FACTS),
+tpl AS (SELECT TEMPLATE_HASH FROM f GROUP BY TEMPLATE_HASH HAVING COUNT(DISTINCT EMPLOYER) > 1),
+pay AS (SELECT PAYER_ACCT FROM f WHERE PAYER_ACCT IS NOT NULL GROUP BY PAYER_ACCT HAVING COUNT(DISTINCT EMPLOYER) > 1),
+dev AS (SELECT DEVICE_ID FROM f GROUP BY DEVICE_ID HAVING COUNT(DISTINCT CUST_ID) > 1)
+SELECT f.APP_ID, 'PAYSLIP_TEMPLATE' AS LINK_TYPE, f.TEMPLATE_HASH AS LINK_VALUE,
+       'same payslip template (' || f.PDF_PRODUCER || ') used by different employers' AS WHY FROM f JOIN tpl ON tpl.TEMPLATE_HASH = f.TEMPLATE_HASH
+UNION ALL
+SELECT f.APP_ID, 'SALARY_PAYER', f.PAYER_IFSC || ' ' || f.PAYER_ACCT, 'salary credited from one account under different employer names'
+FROM f JOIN pay ON pay.PAYER_ACCT = f.PAYER_ACCT
+UNION ALL
+SELECT f.APP_ID, 'DEVICE', f.DEVICE_ID, 'applications from the same device by different customers' FROM f JOIN dev ON dev.DEVICE_ID = f.DEVICE_ID;
+
+CREATE OR REPLACE VIEW LOS_CORE.FRAUD_RING AS
+SELECT d.APP_ID, d.APPLICANT_NAME, d.EMPLOYER, d.SUBMITTED_AT, d.AMOUNT_REQUESTED, d.OFFER_AMOUNT, d.SCORE, d.SYSTEM_DECISION,
+       f.PAYSLIP_NET, f.BANK_SALARY_AVG, f.INCOME_GAP_PCT, f.PAYER_ACCT, f.PAYER_IFSC, f.TEMPLATE_HASH, f.PDF_PRODUCER, f.DEVICE_ID,
+       f.SALARY_ACCOUNT, f.MIN_BALANCE_6M,
+       COUNT(DISTINCT l.LINK_TYPE) AS LINK_TYPES, GROUP_CONCAT(DISTINCT l.LINK_TYPE ORDER BY l.LINK_TYPE SEPARATOR ', ') AS LINKS
+FROM LOS_CORE.FRAUD_LINKS l
+JOIN LOS_CORE.DECISIONS d ON d.APP_ID = l.APP_ID AND d.POLICY_STATUS = 'LIVE'
+JOIN LOS_CORE.APPLICATION_FACTS f ON f.APP_ID = l.APP_ID
+GROUP BY d.APP_ID, d.APPLICANT_NAME, d.EMPLOYER, d.SUBMITTED_AT, d.AMOUNT_REQUESTED, d.OFFER_AMOUNT, d.SCORE, d.SYSTEM_DECISION,
+         f.PAYSLIP_NET, f.BANK_SALARY_AVG, f.INCOME_GAP_PCT, f.PAYER_ACCT, f.PAYER_IFSC, f.TEMPLATE_HASH, f.PDF_PRODUCER, f.DEVICE_ID,
+         f.SALARY_ACCOUNT, f.MIN_BALANCE_6M;

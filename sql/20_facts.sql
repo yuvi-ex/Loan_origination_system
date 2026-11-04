@@ -1,0 +1,55 @@
+-- LOS_CORE.APPLICATION_FACTS_LIVE: ONE row per application, every fact underwriting needs, read live from
+-- MongoDB (what was typed + what was extracted from each PDF), Postgres (what actually happened in the account)
+-- and the bureau response. This join is the cross-verification: no single system can do it.
+CREATE SCHEMA IF NOT EXISTS LOS_CORE;
+
+CREATE OR REPLACE VIEW LOS_CORE.APPLICATION_FACTS_LIVE AS
+WITH a AS (
+  SELECT a.*, CAST(ADD_MONTHS(TRUNC(a.SUBMITTED_AT, 'MM'), -6) AS DATE) AS WIN_FROM,   -- the six full months before
+         CAST(TRUNC(a.SUBMITTED_AT, 'MM') AS DATE) AS WIN_TO
+  FROM LOS_SRC.APPLICATIONS a),
+sal AS (                                     -- salary actually credited (core banking)
+  SELECT a.APP_ID, COUNT(s.MON) AS SALARY_MONTHS, AVG(s.NET_CREDITED) AS BANK_SALARY_AVG,
+         STDDEV_POP(s.NET_CREDITED) AS BANK_SALARY_SD, MAX(s.PAYER_ACCT) AS PAYER_ACCT, MAX(s.PAYER_IFSC) AS PAYER_IFSC
+  FROM a JOIN LOS_SRC.SALARY_MONTHLY s ON s.ACCT_NO = a.SALARY_ACCOUNT AND s.MON >= a.WIN_FROM AND s.MON < a.WIN_TO
+  GROUP BY a.APP_ID),
+beh AS (                                     -- behaviour in the account (core banking)
+  SELECT a.APP_ID, SUM(t.RETURNED_DEBITS) AS RETURNED_DEBITS_6M, SUM(t.GAMING_SPEND) AS GAMING_SPEND_6M,
+         SUM(t.CREDITS) AS CREDITS_6M, MIN(t.MIN_BALANCE) AS MIN_BALANCE_6M
+  FROM a JOIN LOS_SRC.TXN_MONTHLY t ON t.ACCT_NO = a.SALARY_ACCOUNT AND t.MON >= a.WIN_FROM AND t.MON < a.WIN_TO
+  GROUP BY a.APP_ID)
+SELECT a.APP_ID, a.CUST_ID, a.APPLICANT_NAME, a.CITY, a.CHANNEL, a.SUBMITTED_AT, a.AMOUNT_REQUESTED, a.TERM_MONTHS,
+       a.PURPOSE, a.SALARY_ACCOUNT, a.DEVICE_ID,
+       FLOOR(MONTHS_BETWEEN(CAST(a.SUBMITTED_AT AS DATE), a.BIRTH_DATE) / 12) AS AGE_YEARS,   -- eligibility only, never scored
+       p.EMPLOYER, p.EMPLOYER_ADDRESS, p.TEMPLATE_HASH, p.PDF_PRODUCER, p.PAY_MONTH,
+       p.GROSS AS PAYSLIP_GROSS, p.BONUS AS PAYSLIP_BONUS, p.NET AS PAYSLIP_NET, p.DATE_OF_JOINING,
+       FLOOR(MONTHS_BETWEEN(CAST(a.SUBMITTED_AT AS DATE), p.DATE_OF_JOINING) / 12) AS EMP_YEARS,
+       LEAST(COALESCE(p.CONF_NET, 1), COALESCE(p.CONF_GROSS, 1), COALESCE(p.CONF_EMPLOYER, 1), COALESCE(p.CONF_NAME, 1),
+             COALESCE(i.CONF_ID_NUMBER, 1), COALESCE(i.CONF_NAME, 1)) AS MIN_KEY_CONFIDENCE,
+       i.NAME_ON_ID, CASE WHEN UPPER(TRIM(i.NAME_ON_ID)) = UPPER(TRIM(a.APPLICANT_NAME)) THEN 0 ELSE 1 END AS ID_NAME_MISMATCH,
+       s.BANK_SALARY_AVG, COALESCE(s.SALARY_MONTHS, 0) AS SALARY_MONTHS,
+       ROUND(100 * s.BANK_SALARY_SD / NULLIF(s.BANK_SALARY_AVG, 0), 1) AS SALARY_CV_PCT,
+       s.PAYER_ACCT, s.PAYER_IFSC,
+       ROUND(100 * ABS(p.NET - s.BANK_SALARY_AVG) / NULLIF(s.BANK_SALARY_AVG, 0), 1) AS INCOME_GAP_PCT,
+       -- verified income: the payslip's gross, scaled down to what actually arrives in the bank (never scaled up);
+       -- an applicant who does not bank with us has no bank record, so the documents are the evidence
+       CASE WHEN a.CUST_ID IS NULL THEN p.GROSS
+            ELSE ROUND(p.GROSS * LEAST(1, COALESCE(s.BANK_SALARY_AVG / NULLIF(p.NET, 0), 0)), 0) END AS VERIFIED_GROSS,
+       COALESCE(b.RETURNED_DEBITS_6M, 0) AS RETURNED_DEBITS_6M,
+       ROUND(100 * COALESCE(b.GAMING_SPEND_6M, 0) / NULLIF(b.CREDITS_6M, 0), 2) AS GAMING_PCT,
+       b.MIN_BALANCE_6M,
+       u.BUREAU_SCORE, CASE WHEN u.BUREAU_SCORE IS NULL THEN 1 ELSE 0 END AS BUREAU_MISSING,
+       u.INQ_6M, u.PUB_REC, u.ACTIVE_LOANS, u.EXISTING_EMI,
+       CASE WHEN a.CUST_ID IS NULL THEN 0 ELSE 1 END AS BANK_CUSTOMER        -- core banking is not needed for every applicant
+FROM a
+LEFT JOIN LOS_SRC.PAYSLIPS p ON p.APP_ID = a.APP_ID
+LEFT JOIN LOS_SRC.ID_PROOFS i ON i.APP_ID = a.APP_ID
+LEFT JOIN sal s ON s.APP_ID = a.APP_ID
+LEFT JOIN beh b ON b.APP_ID = a.APP_ID
+LEFT JOIN LOS_SRC.BUREAU_PULLS u ON u.APP_ID = a.APP_ID;
+
+-- The accelerated copy the queue reads: rebuilt from the live view in one statement (the console has a button).
+-- Evidence for an open case is always read live.
+CREATE SCHEMA IF NOT EXISTS LOS_ACCEL;
+CREATE OR REPLACE TABLE LOS_ACCEL.APPLICATION_FACTS AS SELECT * FROM LOS_CORE.APPLICATION_FACTS_LIVE;
+CREATE OR REPLACE VIEW LOS_CORE.APPLICATION_FACTS AS SELECT * FROM LOS_ACCEL.APPLICATION_FACTS;

@@ -1,0 +1,302 @@
+"""The SQL the console runs, kept apart from the page so the "For engineers" panels show exactly what ran."""
+
+
+def q(v) -> str:
+    """SQL string literal: every value placed into the SQL below goes through q() (or int()/float()).
+
+    The SQL is built as text on purpose, so the console's "for engineers" panels can show exactly what ran. Doubling
+    the quote is enough for an Exasol string literal; in your own code prefer the driver's parameters
+    (pyexasol: execute("... WHERE ACCT_NO = {acct}", {"acct": value})), which do this for you."""
+    return "NULL" if v is None else "'" + str(v).replace("'", "''") + "'"
+
+HERO = "APP-26-104871"
+
+Q_PIPELINE = """-- the system's decision for every application in the last 30 days, under the LIVE policy
+SELECT SYSTEM_DECISION, COUNT(*) AS APPS, SUM(OFFER_AMOUNT) AS AMOUNT
+FROM   LOS_CORE.DECISIONS
+WHERE  POLICY_STATUS = 'LIVE'
+GROUP  BY SYSTEM_DECISION"""
+
+
+def q_case(app):
+    return f"""SELECT d.*, f.PAYSLIP_GROSS, f.PAYSLIP_NET, f.PAYSLIP_BONUS, f.BANK_SALARY_AVG, f.SALARY_MONTHS, f.INCOME_GAP_PCT,
+       f.VERIFIED_GROSS, f.EXISTING_EMI, f.ACTIVE_LOANS, f.BUREAU_SCORE, f.INQ_6M, f.EMP_YEARS, f.DATE_OF_JOINING,
+       f.MIN_KEY_CONFIDENCE, f.RETURNED_DEBITS_6M, f.GAMING_PCT, f.SALARY_ACCOUNT, f.PAYER_ACCT, f.AGE_YEARS, f.PUB_REC
+FROM   LOS_CORE.DECISIONS d JOIN LOS_CORE.APPLICATION_FACTS f ON f.APP_ID = d.APP_ID
+WHERE  d.POLICY_STATUS = 'LIVE' AND d.APP_ID = {q(app)}"""
+
+
+def q_hits(app):
+    return f"""SELECT RULE_ID, TITLE, OUTCOME, REVIEW_LEVEL, WHY_A_PERSON, EVIDENCE
+FROM   LOS_CORE.RULE_HITS WHERE POLICY_STATUS = 'LIVE' AND APP_ID = {q(app)} ORDER BY RULE_ID"""
+
+
+def q_salary(app):
+    return f"""-- read LIVE from core banking (Postgres): the salary actually credited, month by month
+SELECT s.MON, s.NET_CREDITED, s.PAYER_IFSC, s.PAYER_ACCT, s.NARRATION
+FROM   LOS_SRC.SALARY_MONTHLY s
+JOIN   LOS_SRC.APPLICATIONS a ON a.SALARY_ACCOUNT = s.ACCT_NO
+WHERE  a.APP_ID = {q(app)}
+  AND  s.MON >= ADD_MONTHS(TRUNC(a.SUBMITTED_AT, 'MM'), -6) AND s.MON < TRUNC(a.SUBMITTED_AT, 'MM')
+ORDER  BY s.MON"""
+
+
+def q_payslip(app):
+    return f"""-- read LIVE from the document store (MongoDB): what was extracted from the uploaded payslip
+SELECT p.EMPLOYER, p.EMPLOYEE_NAME, p.PAY_MONTH, p.GROSS, p.BONUS, p.DEDUCTIONS, p.NET, p.CONF_NET, p.MIN_CONFIDENCE,
+       p.EXTRACT_ENGINE, p.EXTRACT_MS, p.FILE_NAME, p.PDF_PRODUCER
+FROM   LOS_SRC.PAYSLIPS p WHERE p.APP_ID = {q(app)}"""
+
+
+def q_lines(app):
+    return f"""SELECT LINE_ITEM, AMOUNT, KIND, RECURRING FROM LOS_SRC.PAYSLIP_LINES WHERE APP_ID = {q(app)} ORDER BY POS"""
+
+
+def q_docs(app):
+    return f"""SELECT DOC_TYPE, FILE_NAME, ENGINE, MS, MIN_CONF FROM LOS_SRC.DOCUMENT_INDEX WHERE APP_ID = {q(app)} ORDER BY 1 DESC"""
+
+
+def q_contrib(app):
+    return f"""SELECT FEATURE, FEATURE_VALUE, BOOK_MEAN, POINTS, REASON FROM LOS_CORE.SCORE_CONTRIBUTIONS
+WHERE POLICY_STATUS = 'LIVE' AND APP_ID = {q(app)} ORDER BY ORDINAL"""
+
+
+Q_MODEL = "SELECT * FROM LOS_POLICY.MODEL"
+Q_AUTH = "SELECT * FROM LOS_POLICY.REVIEWER_AUTHORITY ORDER BY MAX_AMOUNT"
+Q_RULES = "SELECT RULE_ID, TITLE, METRIC, OPERATOR, THRESHOLD, OUTCOME, REVIEW_LEVEL, WHY_A_PERSON, ENABLED FROM LOS_POLICY.REFERRAL_RULES ORDER BY RULE_ID"
+
+
+def q_whatif(app, income, amount, term):
+    """Re-price and re-test one case with the SAME tables (scorecard, policy, bands): only the inputs change."""
+    return f"""-- the case re-scored with the underwriter's inputs: same scorecard, same LIVE policy, same rate bands
+WITH p AS (SELECT * FROM LOS_POLICY.POLICY WHERE STATUS = 'LIVE'),
+f AS (SELECT * FROM LOS_CORE.APPLICATION_FACTS WHERE APP_ID = {q(app)}),
+x AS (SELECT f.EXISTING_EMI, f.BUREAU_SCORE, f.INQ_6M, f.EMP_YEARS, f.PUB_REC, p.*,
+             {float(income)} AS INC, {float(amount)} AS AMT, {int(term)} AS TRM,
+             {float(amount)} * (p.ASSESSMENT_RATE / 1200) / (1 - POWER(1 + p.ASSESSMENT_RATE / 1200, -{int(term)})) AS EMI_A
+      FROM f CROSS JOIN p),
+s AS (SELECT x.*, ROUND(100 * (x.EXISTING_EMI + x.EMI_A) / x.INC, 2) AS FOIR, x.AMT / (x.INC * 12) AS LTI,
+             w.BASE_SCORE - w.FACTOR * (w.B0 + w.W_BUREAU * LEAST(GREATEST(COALESCE(x.BUREAU_SCORE, 696), 300), 850)
+               + w.W_FOIR * LEAST(GREATEST(100 * (x.EXISTING_EMI + x.EMI_A) / x.INC, 0), 60) + w.W_LTI * LEAST(x.AMT / (x.INC * 12), 1)
+               + w.W_INQ * LEAST(x.INQ_6M, 6) + w.W_EMP * LEAST(x.EMP_YEARS, 10) + w.W_TERM * CASE WHEN x.TRM >= 60 THEN 1 ELSE 0 END
+               + w.W_PUB * LEAST(x.PUB_REC, 3) + w.LN_ODDS) AS SCORE_RAW
+      FROM x CROSS JOIN LOS_POLICY.WEIGHTS w)
+SELECT ROUND(s.SCORE_RAW, 0) AS SCORE, r.BAND, s.BASE_RATE + r.RISK_PREMIUM AS RATE, s.FOIR, s.FOIR_CAP, s.FOIR_NEAR_BAND,
+       s.APPROVE_FROM, s.DECLINE_BELOW, s.AUTO_APPROVE_LIMIT, s.POLICY_VERSION,
+       ROUND(s.AMT * ((s.BASE_RATE + r.RISK_PREMIUM) / 1200) / (1 - POWER(1 + (s.BASE_RATE + r.RISK_PREMIUM) / 1200, -s.TRM)), 0) AS EMI,
+       LEAST(s.MAX_LOAN, FLOOR(GREATEST(s.FOIR_CAP / 100 * s.INC - s.EXISTING_EMI, 0) * (1 - POWER(1 + s.ASSESSMENT_RATE / 1200, -s.TRM))
+             / (s.ASSESSMENT_RATE / 1200) / 10000) * 10000) AS MAX_AMOUNT
+FROM s JOIN LOS_POLICY.RATE_BANDS r ON ROUND(s.SCORE_RAW, 0) >= r.SCORE_FROM AND ROUND(s.SCORE_RAW, 0) < r.SCORE_TO"""
+
+
+
+Q_LOG = """SELECT LOG_ID, DECIDED_AT, APP_ID, STEP, DECIDED_BY, ROLE_NAME, SYSTEM_DECISION, FINAL_DECISION, AMOUNT, RATE, TERM_MONTHS,
+       INCOME_BASIS, OVERRIDE_FLAG, REASON_CODE, CONDITIONS, RULES_FIRED, SCORE, POLICY_VERSION, MODEL_VERSION, NEEDS_SECOND_SIGN, NOTES
+FROM   LOS_OPS.DECISION_LOG ORDER BY LOG_ID DESC"""
+
+# ------------------------------------------------------------------ the Loan Origination System additions
+Q_QUEUE_LOS = """-- every case the rules sent to a person, live uploads first
+SELECT d.APP_ID, d.APPLICANT_NAME, d.AMOUNT_REQUESTED, d.REVIEW_LEVEL, d.RULES_FIRED, d.SUBMITTED_AT
+FROM   LOS_CORE.DECISIONS d
+WHERE  d.POLICY_STATUS = 'LIVE' AND d.SYSTEM_DECISION = 'REFER'
+ORDER  BY CASE WHEN d.APP_ID LIKE 'APP-26-2%' THEN 0 ELSE 1 END, d.SUBMITTED_AT DESC"""
+
+
+def q_idp(app):
+    return f"""SELECT NAME_ON_ID, DOB_ON_ID, ID_NUMBER, CONF_ID_NUMBER, CONF_NAME, MIN_CONFIDENCE FROM LOS_SRC.ID_PROOFS WHERE APP_ID = {q(app)}"""
+
+
+def q_letter(app):
+    return f"""SELECT EMPLOYER, DESIGNATION, JOINING_DATE, EMPLOYMENT_TYPE FROM LOS_SRC.EMPLOYMENT_LETTERS WHERE APP_ID = {q(app)}"""
+
+
+def q_bureau(app):
+    return f"""SELECT * FROM LOS_SRC.BUREAU_PULLS WHERE APP_ID = {q(app)}"""
+
+
+def q_customer(acct):
+    return f"""-- core banking (Postgres), live: who owns the salary account named on the form
+SELECT CUST_ID, NAME_ON_RECORD, PAN_ON_RECORD, DOB_ON_RECORD, MOBILE_ON_RECORD, KYC_DONE, CUST_SINCE
+FROM   LOS_SRC.CUSTOMERS WHERE ACCT_NO = {q(acct)}"""
+
+
+def q_bureau_call(app, pan):
+    return f"""-- the credit bureau's API, called by a Python UDF inside Exasol; the response is kept as received
+INSERT INTO LOS_SRC.BUREAU_REPORTS
+SELECT {q(app)}, PAN, CURRENT_TIMESTAMP, HTTP_STATUS, REPORT_ID, BUREAU_SCORE, INQ_6M, PUB_REC, ACTIVE_LOANS, EXISTING_EMI,
+       OLDEST_TRADE_YEARS, MS
+FROM  (SELECT LOS_SRC.BUREAU_API({q(pan)}))"""
+
+
+def q_bureau_pull(app, cust):
+    return f"""-- the bureau pull the decision uses: taken from the API response (only when the bureau had a file)
+INSERT INTO LOS_SRC.BUREAU_PULLS (APP_ID, CUST_ID, PULLED_AT, BUREAU_SCORE, INQ_6M, PUB_REC, ACTIVE_LOANS, EXISTING_EMI, OLDEST_TRADE_YEARS)
+SELECT APP_ID, {q(cust)}, CALLED_AT, BUREAU_SCORE, INQ_6M, PUB_REC, ACTIVE_LOANS, EXISTING_EMI, OLDEST_TRADE_YEARS
+FROM   LOS_SRC.BUREAU_REPORTS WHERE APP_ID = {q(app)} AND HTTP_STATUS = 200"""
+
+
+def q_bureau_report(app):
+    return f"SELECT * FROM LOS_SRC.BUREAU_REPORTS WHERE APP_ID = {q(app)} ORDER BY CALLED_AT DESC LIMIT 1"
+
+
+def q_facts_insert(app):
+    return f"""-- one federated read: MongoDB (form + documents) x Postgres (six months of the salary account) x the bureau pull
+INSERT INTO LOS_ACCEL.APPLICATION_FACTS
+SELECT * FROM LOS_CORE.APPLICATION_FACTS_LIVE WHERE APP_ID = {q(app)}"""
+
+
+def q_log_auto(app):
+    """A decision the system made alone, logged by the decision engine with the policy and model it used."""
+    return f"""INSERT INTO LOS_OPS.DECISION_LOG (APP_ID, DECIDED_AT, DECIDED_BY, ROLE_NAME, STEP, SYSTEM_DECISION, FINAL_DECISION,
+        AMOUNT, RATE, TERM_MONTHS, INCOME_BASIS, OVERRIDE_FLAG, REASON_CODE, RULES_FIRED, SCORE, POLICY_VERSION, MODEL_VERSION, NEEDS_SECOND_SIGN)
+SELECT d.APP_ID, CURRENT_TIMESTAMP, 'Decision engine', 'System', 'AUTO', d.SYSTEM_DECISION, d.SYSTEM_DECISION,
+       CASE WHEN d.SYSTEM_DECISION = 'DECLINE' THEN NULL ELSE d.OFFER_AMOUNT END, d.RATE, d.TERM_MONTHS, f.VERIFIED_GROSS, FALSE,
+       'AUTOMATIC', d.RULES_FIRED, d.SCORE, p.POLICY_VERSION, m.MODEL_VERSION, FALSE
+FROM   LOS_CORE.DECISIONS d JOIN LOS_CORE.APPLICATION_FACTS f ON f.APP_ID = d.APP_ID
+CROSS  JOIN (SELECT POLICY_VERSION FROM LOS_POLICY.POLICY WHERE STATUS = 'LIVE') p CROSS JOIN LOS_POLICY.MODEL m
+WHERE  d.POLICY_STATUS = 'LIVE' AND d.APP_ID = {q(app)} AND d.SYSTEM_DECISION <> 'REFER'"""
+
+
+# ---------------------------------------------------------------- the challenger model (sql/45_ml.sql): Python inside Exasol
+Q_ML_MODEL = "SELECT * FROM LOS_ML.MODEL"
+Q_SCORE_BOOK = """-- every historical loan through the Python model, in batches, inside Exasol
+INSERT INTO LOS_BOOK.ML_SCORES
+SELECT CAST(ROW_KEY AS DECIMAL(12,0)), ML_PD FROM (
+  SELECT LOS_ML.PREDICT_PD(TO_CHAR(LOAN_ID), BUREAU_SCORE, FOIR_AFTER, LOAN_TO_INCOME, INQ_6M, EMP_YEARS,
+         CASE WHEN TERM_MONTHS = 60 THEN 1 ELSE 0 END, PUB_REC, PURPOSE)
+  FROM LOS_BOOK.LOANS GROUP BY MOD(LOAN_ID, 4))"""
+
+
+def q_ml_case(app):
+    """The ML model's PD for one application, from the same inputs the scorecard used."""
+    return f"""SELECT ROW_KEY AS APP_ID, ROUND(100 * ML_PD, 1) AS ML_PD_PCT FROM (
+  SELECT LOS_ML.PREDICT_PD(APP_ID, X_BUREAU, X_FOIR, X_LTI, X_INQ, X_EMP, X_TERM, X_PUB, BOOK_PURPOSE)
+  FROM LOS_ML.APPLICATION_INPUTS WHERE APP_ID = {q(app)})"""
+
+
+# ---------------------------------------------------------------- semantic layer + data contracts (sql/50_semantic.sql)
+
+def q_contract_checks(app=None, acct=None):
+    """Every data contract, evaluated per application against the LIVE sources through the semantic views, each source
+    read once. No arguments: the whole portfolio (the view LOS_SEM.CONTRACT_CHECKS_LIVE). With an application and
+    its salary account: literal filters, so MongoDB and Postgres receive them (pushdown) and one upload checks in ~1 s."""
+    wa = f"WHERE APP_ID = {q(app)}" if app else ""
+    wc = f"WHERE ACCT_NO = {q(acct)}" if acct else ""
+    return f"""WITH a AS (SELECT APP_ID, CUST_ID AS APP_CUST_ID, SUBMITTED_AT, AMOUNT_REQUESTED, TERM_MONTHS, SALARY_ACCOUNT FROM LOS_SRC.APPLICATIONS {wa}),
+d AS (SELECT APP_ID, MAX(CASE WHEN DOC_TYPE = 'APPLICATION_FORM' THEN 1 ELSE 0 END) AS HAS_FORM,
+             MAX(CASE WHEN DOC_TYPE = 'PAYSLIP' THEN 1 ELSE 0 END) AS HAS_PAY, MAX(CASE WHEN DOC_TYPE = 'ID_PROOF' THEN 1 ELSE 0 END) AS HAS_ID,
+             MAX(CASE WHEN DOC_TYPE = 'EMPLOYMENT_LETTER' THEN 1 ELSE 0 END) AS HAS_LET
+      FROM LOS_SRC.DOCUMENT_INDEX {wa} GROUP BY APP_ID),
+p AS (SELECT APP_ID, GROSS, DEDUCTIONS, NET, PAY_MONTH FROM LOS_SRC.PAYSLIPS {wa}),
+i AS (SELECT APP_ID, ID_NUMBER FROM LOS_SRC.ID_PROOFS {wa}),
+c AS (SELECT ACCT_NO, CUST_ID, PAN_ON_RECORD, DOB_ON_RECORD FROM LOS_SRC.CUSTOMERS {wc}),
+t AS (SELECT ACCT_NO, SUM(CASE WHEN AMOUNT IS NULL OR AMOUNT <= 0 THEN 1 ELSE 0 END) AS BAD_AMT, MAX(TXN_DATE) AS LAST_TXN
+      FROM LOS_SRC.TRANSACTIONS {wc} GROUP BY ACCT_NO),
+b AS (SELECT APP_ID, BUREAU_SCORE, PULLED_AT FROM LOS_SRC.BUREAU_PULLS {wa}),
+j AS (SELECT a.*, COALESCE(d.HAS_FORM, 0) AS HAS_FORM, COALESCE(d.HAS_PAY, 0) AS HAS_PAY, COALESCE(d.HAS_ID, 0) AS HAS_ID,
+             COALESCE(d.HAS_LET, 0) AS HAS_LET, p.GROSS, p.DEDUCTIONS, p.NET, p.PAY_MONTH, i.ID_NUMBER,
+             c.CUST_ID, c.PAN_ON_RECORD, c.DOB_ON_RECORD, t.BAD_AMT, t.LAST_TXN, b.BUREAU_SCORE, b.PULLED_AT
+      FROM a LEFT JOIN d ON d.APP_ID = a.APP_ID LEFT JOIN p ON p.APP_ID = a.APP_ID LEFT JOIN i ON i.APP_ID = a.APP_ID
+      LEFT JOIN c ON c.ACCT_NO = a.SALARY_ACCOUNT LEFT JOIN t ON t.ACCT_NO = a.SALARY_ACCOUNT LEFT JOIN b ON b.APP_ID = a.APP_ID)
+SELECT j.APP_ID, k.CONTRACT_ID,
+  CASE k.CONTRACT_ID
+    WHEN 'DS01' THEN HAS_PAY + HAS_ID = 2
+    WHEN 'DS07' THEN HAS_LET = 1
+    WHEN 'DS02' THEN GROSS IS NOT NULL AND DEDUCTIONS IS NOT NULL AND NET IS NOT NULL
+    WHEN 'DS03' THEN ABS(GROSS - DEDUCTIONS - NET) <= 1
+    WHEN 'DS04' THEN TO_DATE(PAY_MONTH || '-01', 'YYYY-MM-DD') >= ADD_MONTHS(TRUNC(SUBMITTED_AT, 'MM'), -2)
+    WHEN 'DS05' THEN ID_NUMBER REGEXP_LIKE '[A-Z]{{5}}[0-9]{{4}}[A-Z]'
+    WHEN 'DS06' THEN AMOUNT_REQUESTED BETWEEN 50000 AND 4000000 AND TERM_MONTHS BETWEEN 12 AND 60 AND SALARY_ACCOUNT IS NOT NULL
+    WHEN 'CB01' THEN APP_CUST_ID IS NULL OR CUST_ID = APP_CUST_ID
+    WHEN 'CB02' THEN APP_CUST_ID IS NULL OR IS_DATE(DOB_ON_RECORD, 'DD-MM-YYYY')
+    WHEN 'CB03' THEN APP_CUST_ID IS NULL OR COALESCE(BAD_AMT, 0) = 0
+    WHEN 'CB04' THEN APP_CUST_ID IS NULL OR LAST_TXN >= ADD_MONTHS(TRUNC(SUBMITTED_AT, 'MM'), -1)
+    WHEN 'BU01' THEN BUREAU_SCORE IS NULL OR (BUREAU_SCORE BETWEEN 300 AND 900 AND PULLED_AT >= SUBMITTED_AT - INTERVAL '30' DAY)
+    WHEN 'XS01' THEN APP_CUST_ID IS NULL OR UPPER(TRIM(ID_NUMBER)) = UPPER(TRIM(PAN_ON_RECORD))
+  END AS PASSED,
+  CASE k.CONTRACT_ID
+    WHEN 'DS01' THEN CASE WHEN HAS_PAY + HAS_ID = 2 THEN 'payslip and PAN card on file'
+                          ELSE 'missing: ' || TRIM(CASE WHEN HAS_PAY = 0 THEN 'payslip ' ELSE '' END || CASE WHEN HAS_ID = 0 THEN 'PAN card' ELSE '' END) END
+    WHEN 'DS07' THEN CASE WHEN HAS_LET = 1 THEN 'employment letter on file' ELSE 'no employment letter' END
+    WHEN 'DS02' THEN 'gross ' || COALESCE(TO_CHAR(GROSS), 'missing') || ', deductions ' || COALESCE(TO_CHAR(DEDUCTIONS), 'missing') || ', net ' || COALESCE(TO_CHAR(NET), 'missing')
+    WHEN 'DS03' THEN TO_CHAR(GROSS) || ' - ' || TO_CHAR(DEDUCTIONS) || ' vs net ' || TO_CHAR(NET)
+    WHEN 'DS04' THEN 'pay month ' || COALESCE(PAY_MONTH, 'missing') || ', applied ' || TO_CHAR(SUBMITTED_AT, 'YYYY-MM-DD')
+    WHEN 'DS05' THEN 'PAN ' || COALESCE(ID_NUMBER, 'missing')
+    WHEN 'DS06' THEN TO_CHAR(AMOUNT_REQUESTED) || ' over ' || TO_CHAR(TERM_MONTHS) || ' months, account ' || COALESCE(SALARY_ACCOUNT, 'missing')
+    WHEN 'CB01' THEN CASE WHEN APP_CUST_ID IS NULL THEN 'not a bank customer: not applicable' ELSE 'account ' || COALESCE(SALARY_ACCOUNT, '?') || ' -> ' || COALESCE(CUST_ID, 'no owner') END
+    WHEN 'CB02' THEN CASE WHEN APP_CUST_ID IS NULL THEN 'not a bank customer: not applicable' ELSE 'dob_txt ' || COALESCE(DOB_ON_RECORD, 'missing') END
+    WHEN 'CB03' THEN CASE WHEN APP_CUST_ID IS NULL THEN 'not a bank customer: not applicable' ELSE COALESCE(BAD_AMT, 0) || ' transactions with an empty or zero amount' END
+    WHEN 'CB04' THEN CASE WHEN APP_CUST_ID IS NULL THEN 'not a bank customer: not applicable' ELSE 'last transaction ' || COALESCE(TO_CHAR(LAST_TXN, 'YYYY-MM-DD'), 'none') END
+    WHEN 'BU01' THEN 'score ' || COALESCE(TO_CHAR(BUREAU_SCORE), 'none') || ', pulled ' || COALESCE(TO_CHAR(PULLED_AT, 'YYYY-MM-DD'), 'never')
+    WHEN 'XS01' THEN CASE WHEN APP_CUST_ID IS NULL THEN 'not a bank customer: not applicable' ELSE 'card ' || COALESCE(ID_NUMBER, '?') || ' vs core banking ' || COALESCE(PAN_ON_RECORD, '?') END
+  END AS EVIDENCE
+FROM j CROSS JOIN LOS_SEM.CONTRACTS k"""
+
+
+Q_CONTRACT_RUN = """-- every contract for every application, through the semantic views, against the live sources
+INSERT INTO LOS_SEM.CONTRACT_RESULTS
+SELECT APP_ID, CONTRACT_ID, COALESCE(PASSED, FALSE), EVIDENCE, CURRENT_TIMESTAMP FROM LOS_SEM.CONTRACT_CHECKS_LIVE"""
+Q_CONTRACT_SUMMARY = """SELECT k.CONTRACT_ID, k.SOURCE_SYSTEM, k.DATASET, k.EXPECTATION, k.SEVERITY, k.OWNER, COUNT(r.APP_ID) AS APPS_CHECKED,
+       SUM(CASE WHEN r.PASSED THEN 0 ELSE 1 END) AS BREACHES,
+       MAX(CASE WHEN NOT r.PASSED THEN r.APP_ID || ': ' || r.EVIDENCE END) AS EXAMPLE
+FROM LOS_SEM.CONTRACTS k LEFT JOIN LOS_SEM.CONTRACT_RESULTS r ON r.CONTRACT_ID = k.CONTRACT_ID
+GROUP BY k.CONTRACT_ID, k.SOURCE_SYSTEM, k.DATASET, k.EXPECTATION, k.SEVERITY, k.OWNER, k.ORDINAL ORDER BY k.ORDINAL"""
+Q_TERMS = "SELECT * FROM LOS_SEM.TERMS ORDER BY ORDINAL"
+Q_CONTRACT_LAST_RUN = "SELECT * FROM LOS_SEM.CONTRACT_RUNS ORDER BY RUN_AT DESC LIMIT 1"
+Q_ZERO_TXN_SCAN = """-- the whole core-banking feed, not just applicants' accounts: the rows breaking contract CB03
+SELECT COUNT(*) AS ROWS_BAD, COUNT(DISTINCT ACCT_NO) AS ACCOUNTS, MIN(NARRATION) AS NARRATION FROM LOS_SRC.TRANSACTIONS
+WHERE AMOUNT IS NULL OR AMOUNT <= 0"""
+
+
+def q_contracts_app(app):
+    return f"""SELECT k.CONTRACT_ID, k.SOURCE_SYSTEM, k.DATASET, k.EXPECTATION, k.SEVERITY, k.OWNER, r.PASSED, r.EVIDENCE
+FROM LOS_SEM.CONTRACTS k JOIN LOS_SEM.CONTRACT_RESULTS r ON r.CONTRACT_ID = k.CONTRACT_ID
+WHERE r.APP_ID = {q(app)} ORDER BY k.ORDINAL"""
+
+
+# ---------------------------------------------------------------- LOS insights (tab 4): what came in, where it went, what to change
+Q_INS_STATUS = """-- every application received, by the system's decision under the LIVE policy, and whether a person has decided it since
+WITH lg AS (SELECT APP_ID, FINAL_DECISION FROM LOS_OPS.DECISION_LOG
+            QUALIFY ROW_NUMBER() OVER (PARTITION BY APP_ID ORDER BY LOG_ID DESC) = 1)
+SELECT d.SYSTEM_DECISION, d.REVIEW_LEVEL, COUNT(*) AS APPS, SUM(d.AMOUNT_REQUESTED) AS ASKED, SUM(d.OFFER_AMOUNT) AS OFFERED,
+       SUM(CASE WHEN lg.APP_ID IS NOT NULL THEN 1 ELSE 0 END) AS DECIDED_BY_PERSON, ROUND(AVG(d.SCORE)) AS AVG_SCORE
+FROM   LOS_CORE.DECISIONS d LEFT JOIN lg ON lg.APP_ID = d.APP_ID
+WHERE  d.POLICY_STATUS = 'LIVE'
+GROUP  BY d.SYSTEM_DECISION, d.REVIEW_LEVEL"""
+
+Q_INS_RULES = """-- each rule: how often it fired, how often it was the ONLY reason, and how strong those applicants' scores were
+SELECT r.RULE_ID, r.TITLE, r.OUTCOME, r.REVIEW_LEVEL, r.METRIC, r.OPERATOR, r.THRESHOLD,
+       COUNT(d.APP_ID) AS FIRES,
+       SUM(CASE WHEN d.RULES_FIRED = r.RULE_ID THEN 1 ELSE 0 END) AS ALONE,
+       SUM(CASE WHEN d.RULES_FIRED = r.RULE_ID AND d.SCORE >= 620 THEN 1 ELSE 0 END) AS ALONE_STRONG,
+       ROUND(AVG(d.SCORE)) AS AVG_SCORE
+FROM   LOS_POLICY.REFERRAL_RULES r
+LEFT JOIN LOS_CORE.DECISIONS d
+       ON d.POLICY_STATUS = 'LIVE' AND INSTR(',' || d.RULES_FIRED || ',', ',' || r.RULE_ID || ',') > 0
+GROUP  BY r.RULE_ID, r.TITLE, r.OUTCOME, r.REVIEW_LEVEL, r.METRIC, r.OPERATOR, r.THRESHOLD
+ORDER  BY r.RULE_ID"""
+
+Q_INS_BOOK = """-- what really happened to 1.34M funded loans (Lending Club 2007-2018), by score band and by FOIR band
+SELECT 'SCORE' AS K, CASE WHEN SCORE_BAND < 560 THEN 1 WHEN SCORE_BAND < 580 THEN 2 WHEN SCORE_BAND < 600 THEN 3
+                          WHEN SCORE_BAND < 640 THEN 4 ELSE 5 END AS B, 'all' AS S, SUM(LOANS) AS LOANS, SUM(DEFAULTS) AS DEFAULTS
+FROM LOS_BOOK.FRONTIER GROUP BY 2
+UNION ALL
+SELECT 'FOIR', CASE WHEN FOIR_BAND <= 40 THEN 1 WHEN FOIR_BAND <= 42 THEN 2 WHEN FOIR_BAND <= 45 THEN 3 ELSE 4 END,
+       CASE WHEN SCORE_BAND >= 600 THEN 'strong' ELSE 'weak' END, SUM(LOANS), SUM(DEFAULTS)
+FROM LOS_BOOK.FRONTIER GROUP BY 2, 3"""
+
+Q_INS_CHECKS = """-- the follow-up facts behind each lesson, one row each
+SELECT 'RING' AS K, COUNT(*) AS N, SUM(CASE WHEN d.SYSTEM_DECISION LIKE 'APPROVE%' THEN 1 ELSE 0 END) AS M, SUM(d.AMOUNT_REQUESTED) AS AMT
+FROM LOS_CORE.FRAUD_RING r JOIN LOS_CORE.DECISIONS d ON d.APP_ID = r.APP_ID AND d.POLICY_STATUS = 'LIVE'
+UNION ALL
+SELECT 'R02_BONUS', COUNT(*), SUM(CASE WHEN ABS(f.PAYSLIP_NET - COALESCE(f.PAYSLIP_BONUS, 0) - f.BANK_SALARY_AVG) <= 0.15 * f.BANK_SALARY_AVG
+                                    THEN 1 ELSE 0 END), NULL
+FROM LOS_CORE.DECISIONS d JOIN LOS_CORE.APPLICATION_FACTS f ON f.APP_ID = d.APP_ID
+WHERE d.POLICY_STATUS = 'LIVE' AND d.RULES_FIRED = 'R02'
+UNION ALL
+SELECT 'FOIR_40_42_WEAK', COUNT(*), SUM(CASE WHEN SYSTEM_DECISION LIKE 'APPROVE%' THEN 1 ELSE 0 END), NULL
+FROM LOS_CORE.DECISIONS WHERE POLICY_STATUS = 'LIVE' AND FOIR_PCT > 40 AND FOIR_PCT <= 42 AND SCORE < 600
+UNION ALL
+SELECT 'R03_MOBILE', SUM(CASE WHEN INSTR(RULES_FIRED, 'R03') > 0 THEN 1 ELSE 0 END),
+       SUM(CASE WHEN INSTR(RULES_FIRED, 'R03') > 0 AND CHANNEL = 'Mobile app' THEN 1 ELSE 0 END), NULL
+FROM LOS_CORE.DECISIONS WHERE POLICY_STATUS = 'LIVE'"""
